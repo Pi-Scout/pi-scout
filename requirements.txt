@@ -1,0 +1,2 @@
+google-genai>=0.1.0
+tldextract>=5.0.0

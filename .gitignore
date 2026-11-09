@@ -1,0 +1,18 @@
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Pi-Scout runtime logs, tokens, and local caches
+pi_scout_decisions.jsonl
+pi_scout_backlog.json
+pi_scout_decided.json
+pi_scout_ui_token
+pi_scout_backups/
+
+# System / OS files
+.DS_Store
+Thumbs.db
