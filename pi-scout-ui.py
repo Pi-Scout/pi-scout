@@ -29,9 +29,34 @@ from urllib.parse import urlparse, parse_qs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = "/var/tmp/pi_scout_ui_token"
+CONFIG_PATH = os.path.join(HERE, "config.json")
 ENGINE = None
 TOKEN = ""
 NO_AUTH = False
+
+
+# --------------------------------------------------------------------------
+# Configuration Persistence
+# --------------------------------------------------------------------------
+def load_config():
+    default_config = {"autostart": False}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return {**default_config, **json.load(f)}
+        except Exception:
+            pass
+    return default_config
+
+
+def save_config(new_settings):
+    config = load_config()
+    config.update(new_settings)
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(config, f, indent=4)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -127,6 +152,7 @@ class Engine:
         self.last_error = ""
         self.guard = None
         self.cache = {"t": 0.0, "wild": 0, "exact": 0, "never": [], "bycat": {}}
+        self._chain_to_live = False
 
         orig_gravity = core.run_gravity
 
@@ -196,6 +222,7 @@ class Engine:
                 "series": self.series(),
                 "events": evs,
                 "last_id": self.next_id - 1,
+                "autostart": load_config().get("autostart", False),
             }
 
     # ---- controls ---------------------------------------------------------
@@ -286,7 +313,19 @@ class Engine:
     # ---- worker -----------------------------------------------------------
     def _run(self, mode):
         try:
-            self._live() if mode == "live" else self._audit()
+            if mode == "live":
+                self._live()
+            elif mode == "audit":
+                self._audit()
+                if getattr(self, "_chain_to_live", False) and not self.stop.is_set():
+                    self._chain_to_live = False
+                    self.emit("system", "History scan finished", "Auto-starting live hunter...")
+                    with self.lock:
+                        self.audit = {"done": 0, "total": 0, "phase": "idle"}
+                        self.mode = "live"
+                    self._live()
+                else:
+                    self._chain_to_live = False
         except Exception as e:
             self.last_error = str(e)
             self.stats["errors"] += 1
@@ -299,9 +338,10 @@ class Engine:
                 pass
             with self.lock:
                 self.mode = "idle"
-                self.audit["phase"] = "idle"
+                self.audit = {"done": 0, "total": 0, "phase": "idle"}
                 self.started_at = None
                 self.queue_len = 0
+                self._chain_to_live = False
 
     def _process(self, batch, guard, fam, decided):
         ps = self.ps
@@ -437,20 +477,32 @@ class Engine:
         cands = [d for d in cands if ps.is_candidate(d, guard, decided)]
         self.audit = {"done": 0, "total": len(cands), "phase": "reviewing"}
         self.emit("system", f"{len(cands)} candidates to review", "")
-        for i in range(0, len(cands), ps.BATCH_SIZE):
-            if self.stop.is_set():
-                break
+
+        i = 0
+        while i < len(cands) and not self.stop.is_set():
             chunk = cands[i:i + ps.BATCH_SIZE]
-            try:
-                self._process(chunk, guard, fam, decided)
-            except Exception as e:
-                self.stats["errors"] += 1
-                self.last_error = str(e)
-                self.emit("error", "Gemini API error — scan stopped", str(e)[:200])
-                break
+            backoff = 10
+            for attempt in range(3):
+                if self.stop.is_set():
+                    break
+                try:
+                    self._process(chunk, guard, fam, decided)
+                    break
+                except Exception as e:
+                    self.last_error = str(e)
+                    if attempt == 2:
+                        self.stats["errors"] += 1
+                        self.emit("error", "Gemini API error — skipping batch", str(e)[:160])
+                    else:
+                        self.emit("system", f"Gemini API rate limit/error, retrying in {backoff}s...", str(e)[:160])
+                        time.sleep(backoff)
+                        backoff *= 2
+
             self.audit["done"] = min(len(cands), i + len(chunk))
+            i += ps.BATCH_SIZE
             if self.stop.wait(2):  # gentle on free-tier rate limits
                 break
+
         added = (self.stats["wild"] - before["wild"]) + (self.stats["exact"] - before["exact"])
         self.last_audit = {"ts": time.time(), "reviewed": self.audit["done"], "total": self.audit["total"],
                            "added": added, "refused": self.stats["rejected"] - before["rejected"]}
@@ -486,6 +538,88 @@ def read_rules(ps):
                               "category": m.get("category"), "reason": m.get("reason"), "ts": m.get("ts")})
     rules.sort(key=lambda r: (r["ts"] is None, -(r["ts"] or 0), r["value"]))
     return rules
+
+
+def check_domain_blocked_by_pi_scout(domain, ps):
+    """Checks if a domain matches any active Pi-Scout wildcard or exact rule."""
+    domain = (domain or "").lower().strip().rstrip(".")
+    if not domain:
+        return {"blocked": False}
+
+    blocks = ps.load_blocks_by_file()
+    cat_of = {ps.category_path(c): c for c in ps.CATEGORIES}
+
+    for path, (wildcards, exacts) in blocks.items():
+        cat = cat_of.get(path, "other")
+        if domain in exacts:
+            return {"blocked": True, "kind": "exact", "rule": domain, "category": cat}
+
+        for w in wildcards:
+            if domain == w or domain.endswith("." + w):
+                return {"blocked": True, "kind": "wildcard", "rule": f"||{w}^", "category": cat}
+
+    return {"blocked": False}
+
+
+def get_pihole_blocked_by_scout(ps, limit=100):
+    """Queries Pi-hole FTL database for recent blocked queries and tags those caught by Pi-Scout."""
+    if not os.path.exists(ps.DB_PATH):
+        return []
+
+    blocks = ps.load_blocks_by_file()
+    cat_of = {ps.category_path(c): c for c in ps.CATEGORIES}
+
+    exact_map = {}
+    wild_list = []
+    for path, (wildcards, exacts) in blocks.items():
+        cat = cat_of.get(path, "other")
+        for e in exacts:
+            exact_map[e] = (e, cat)
+        for w in wildcards:
+            wild_list.append((w, f"||{w}^", cat))
+
+    results = []
+    try:
+        conn = sqlite3.connect(ps.DB_PATH, timeout=5)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT domain, timestamp, client, status
+            FROM queries
+            WHERE status IN (1, 4, 5, 9, 10, 11)
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit * 4,))
+        rows = cur.fetchall()
+        conn.close()
+
+        for domain, ts, client, status in rows:
+            d = (domain or "").lower().strip().rstrip(".")
+            if not d:
+                continue
+            matched = None
+            if d in exact_map:
+                rule, cat = exact_map[d]
+                matched = {"kind": "exact", "rule": rule, "category": cat}
+            else:
+                for w, rule_str, cat in wild_list:
+                    if d == w or d.endswith("." + w):
+                        matched = {"kind": "wildcard", "rule": rule_str, "category": cat}
+                        break
+
+            if matched:
+                results.append({
+                    "domain": d,
+                    "ts": ts,
+                    "client": client,
+                    "blocked_by": "pi-scout",
+                    **matched
+                })
+                if len(results) >= limit:
+                    break
+    except Exception:
+        pass
+
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -540,6 +674,14 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/rules":
             rules = read_rules(ENGINE.ps)
             return self._json({"total": len(rules), "rules": rules[:3000]})
+        if u.path == "/api/check-blocked":
+            domain = (qs.get("domain") or [""])[0]
+            res = check_domain_blocked_by_pi_scout(domain, ENGINE.ps)
+            return self._json(res)
+        if u.path == "/api/pihole-blocks":
+            limit = min(500, max(1, int((qs.get("limit") or ["100"])[0] or 100)))
+            items = get_pihole_blocked_by_scout(ENGINE.ps, limit=limit)
+            return self._json({"total": len(items), "blocks": items})
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -558,6 +700,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/api/control":
                 ENGINE.set_options(body.get("aggression"), body.get("categories"))
+                if "autostart" in body:
+                    save_config({"autostart": bool(body.get("autostart"))})
                 act = body.get("action")
                 if act == "start":
                     ok, msg = ENGINE.start("live")
@@ -659,7 +803,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
 .sw input:checked+.knob{background:var(--ok)}.sw input:checked+.knob:after{left:21px}
 .sw input:focus-visible+.knob{outline:2px solid var(--b2);outline-offset:2px}
 .swt{display:flex;flex-direction:column;line-height:1.25;min-width:0}.swt small{color:var(--mut);font-size:12px}
-.prog{height:6px;border-radius:9px;background:#1c2740;margin-top:2px;overflow:hidden}.prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--info),var(--b2));transition:width .4s}
+.prog{height:6px;border-radius:99px;background:#1c2740;margin-top:2px;overflow:hidden}.prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--info),var(--b2));transition:width .4s}
 .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:12px}
 .kpi{padding:12px 14px;border-radius:14px;border:1px solid var(--line);background:linear-gradient(180deg,#131b2d,#0f1626);display:flex;flex-direction:column;gap:1px;position:relative;overflow:hidden}
 .kpi:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--c,var(--b1))}
@@ -708,6 +852,7 @@ select.search{width:auto;min-width:150px}
 .t-e{background:rgba(148,163,184,.1);color:var(--mut)}
 .pillc{font-size:10px;font-weight:800;padding:1px 8px;border-radius:99px;letter-spacing:.04em;text-transform:uppercase;background:var(--ccb);color:var(--cc)}
 .pc-ads{--cc:var(--ads);--ccb:var(--adsb)}.pc-tracking{--cc:var(--trk);--ccb:var(--trkb)}.pc-adult{--cc:var(--adl);--ccb:var(--adlb)}.pc-other{--cc:var(--oth);--ccb:var(--othb)}
+.badge-scout{font-size:10px;font-weight:800;padding:2px 8px;border-radius:99px;background:rgba(99,102,241,0.22);color:#a5b4fc;border:1px solid rgba(99,102,241,0.45);letter-spacing:.03em;white-space:nowrap}
 .empty{display:grid;place-items:center;text-align:center;gap:8px;padding:70px 20px;color:var(--mut)}
 .radar{width:54px;height:54px;border-radius:50%;border:2px solid var(--line2);position:relative;overflow:hidden}
 .radar:after{content:"";position:absolute;inset:0;background:conic-gradient(from 0deg,rgba(34,211,238,.5),transparent 40%);animation:spin 2.4s linear infinite}
@@ -824,6 +969,13 @@ select.search{width:auto;min-width:150px}
   <div class="scanh"><b>History scan</b><span class="scand">A one-time review of the last 30 days of lookups your lists let through, to find ad, tracker and adult domains they missed. It runs once and stops.</span></div>
   <div class="scanrow"><button class="btn small" id="auditBtn">Scan last 30 days</button><span class="scanst" id="scanSt"></span></div>
   <div class="prog" id="prog" hidden><i id="progBar"></i></div>
+  <div class="rowb" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line);margin-bottom:0">
+   <label class="sw">
+    <input type="checkbox" id="autostartToggle">
+    <span class="knob"></span>
+    <span class="swt"><b>Auto-Start on Boot</b><small>Runs 30-day history scan then live scan automatically</small></span>
+   </label>
+  </div>
  </div>
 </section>
 
@@ -838,12 +990,15 @@ select.search{width:auto;min-width:150px}
 <main class="grid">
  <section class="card main">
   <div class="tabs">
-   <button class="tab on" data-t="rules">Rules <em id="tabRules">0</em></button><button class="tab" data-t="feed">Live feed <em id="tabFeed" hidden>0</em></button><div class="sp"></div>
+   <button class="tab on" data-t="rules">Rules <em id="tabRules">0</em></button>
+   <button class="tab" data-t="pihole">Pi-hole Blocks <em id="tabPihole" hidden>0</em></button>
+   <button class="tab" data-t="feed">Live feed <em id="tabFeed" hidden>0</em></button><div class="sp"></div>
    <div class="fl" id="feedTools" hidden><button class="fc on" data-f="all">All</button><button class="fc" data-f="block">Blocks</button><button class="fc" data-f="reject">Refused</button><button class="fc" data-f="system">System</button><label class="mini"><input type="checkbox" id="cand">Candidates</label></div>
    <div class="rtools" id="ruleTools"><select class="search" id="catSel" aria-label="Filter by category"><option value="">All categories</option><option value="ads">Ads</option><option value="tracking">Tracking</option><option value="adult">Adult</option><option value="other">Other</option></select>
    <input class="search" id="q" placeholder="Search rules…" aria-label="Search rules"></div>
   </div>
   <div id="feed" class="feed" hidden></div>
+  <div id="piholeBox" hidden><div class="tw"><table class="tbl"><thead><tr><th>Blocked Domain</th><th>Matched Rule</th><th>List</th><th>Client</th><th>Time</th></tr></thead><tbody id="piholeBody"></tbody></table></div><div class="note" id="piholeNote"></div></div>
   <div id="rulesBox"><div class="tw"><table class="tbl"><thead><tr><th>Rule</th><th>Type</th><th>Conf.</th><th>List</th><th>Reason</th><th></th></tr></thead><tbody id="rulesBody"></tbody></table></div><div class="note" id="rulesNote"></div></div>
  </section>
  <aside class="side">
@@ -874,7 +1029,7 @@ const ICON={block:svg(SH+'<path d="M9 12l2 2 4-4"/>'),reject:svg(SH+'<path d="M9
 const LABEL={block:'BLOCKED',reject:'REFUSED',queue:'QUEUED',batch:'GEMINI',gravity:'GRAVITY',error:'ERROR',allow:'ALLOWED',reset:'CLEARED',system:'INFO'};
 const DOMAIN_KINDS=['block','reject','queue','allow'],SYS_KINDS=['system','batch','gravity','error','allow','reset'];
 const CATL={ads:'Ads',tracking:'Tracking',adult:'Adult',other:'Other'};
-const S={cat:'',catSig:'',since:0,events:[],filter:'all',cand:false,tab:'rules',unseen:0,rulesSig:'',st:null,drag:false,fresh:new Set(),rules:[],q:'',limit:50};
+const S={cat:'',catSig:'',since:0,events:[],filter:'all',cand:false,tab:'rules',unseen:0,rulesSig:'',st:null,drag:false,fresh:new Set(),rules:[],pihole:[],q:'',limit:50};
 const fmtTime=t=>new Date(t*1000).toLocaleTimeString([], {hour12:false});
 const ago=t=>{if(!t)return'—';const s=Math.max(0,Date.now()/1000-t);return s<90?'just now':s<5400?Math.round(s/60)+'m ago':s<172800?Math.round(s/3600)+'h ago':Math.round(s/86400)+'d ago'};
 const dur=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h ${m}m`:m?`${m}m ${s%60}s`:`${s}s`};
@@ -901,7 +1056,10 @@ function renderTop(s){
  if(s.mode==='clearing'){run.textContent='Clearing…';run.className='btn'}
  else if(s.mode==='idle'){run.textContent='Start';run.className='btn primary'}
  else{run.textContent=s.stopping?'Stopping…':(s.mode==='audit'?'Stop scan':'Stop');run.className='btn danger'}
- renderScan(s)}
+ renderScan(s);
+ const at=$('#autostartToggle');
+ if(at && document.activeElement !== at){at.checked = !!s.autostart;}
+}
 function renderScan(s){
  const b=$('#auditBtn'),st=$('#scanSt'),pr=$('#prog'),a=s.audit;
  if(s.mode==='audit'){
@@ -977,7 +1135,23 @@ function renderRules(){
   list=q?base.filter(r=>r.value.includes(q)||(r.reason||'').toLowerCase().includes(q)):base,shown=list.slice(0,S.limit),more=list.length-shown.length;
  $('#rulesBody').innerHTML=shown.map(ruleRow).join('');
  $('#rulesNote').innerHTML=list.length?`<span>${shown.length} of ${list.length} rule${list.length===1?'':'s'}</span>${more>0?`<button class="btn small ghost" id="more">Show ${Math.min(50,more)} more</button>`:''}`:esc(S.rules.length?'No rules match.':'No rules yet — they appear here as Pi-Scout finds ad, tracker and adult domains.')}
+function renderPiholeBlocks(){
+ $('#piholeBody').innerHTML=S.pihole.map(b=>{
+  const c=esc(b.category);
+  return `<tr class="c-${c}">
+   <td><span class="dm">${esc(b.domain)}</span><div style="margin-top:4px"><span class="badge-scout">🛡️ Blocked by Pi-Scout AI</span></div></td>
+   <td><span class="tag ${b.kind==='wildcard'?'t-w':'t-e'}">${esc(b.rule)}</span></td>
+   <td><span class="pillc pc-${c}">${esc(CATL[b.category]||b.category)}</span></td>
+   <td><span class="ed">${esc(b.client||'—')}</span></td>
+   <td><span class="ed">${esc(ago(b.ts))}</span></td>
+  </tr>`;
+ }).join('');
+ $('#piholeNote').innerHTML=S.pihole.length?`<span>Showing latest ${S.pihole.length} Pi-hole blocks triggered by Pi-Scout rules</span>`:'<span>No recent Pi-hole blocked queries matched a Pi-Scout rule yet.</span>';
+ const badge=$('#tabPihole');
+ if(S.pihole.length){badge.hidden=false;badge.textContent=S.pihole.length;}
+}
 async function loadRules(){try{const j=await api('/api/rules');S.rules=j.rules;renderRules()}catch(e){}}
+async function loadPiholeBlocks(){try{const j=await api('/api/pihole-blocks');S.pihole=j.blocks||[];renderPiholeBlocks()}catch(e){}}
 function ingest(s){
  const prev=S.since;S.fresh=new Set();
  s.events.forEach(e=>{if(e.id>S.since){S.events.unshift(e);if(prev){S.fresh.add(e.id);if(S.tab!=='feed'&&['block','reject','error'].includes(e.kind))S.unseen++}}});
@@ -997,18 +1171,34 @@ $('#auditBtn').onclick=async()=>{const s=S.st;if(!s)return;
  try{if(s.mode==='audit'){await api('/api/control',{action:'stop'})}
   else{await api('/api/control',{aggression:+$('#agg').value});await api('/api/audit',{});toast('Scanning the last 30 days…','ok')}}
  catch(e){toast(e.message,'err')}};
+$('#autostartToggle').onchange=async e=>{
+ try{await api('/api/control',{autostart:e.target.checked});
+  toast(e.target.checked?'Auto-start enabled':'Auto-start disabled','ok')}
+ catch(err){toast(err.message,'err');e.target.checked=!e.target.checked}};
 const agg=$('#agg');
 agg.addEventListener('input',()=>{S.drag=true;setAgg(agg.value)});
 agg.addEventListener('change',async()=>{try{await api('/api/control',{aggression:+agg.value})}catch(e){toast(e.message,'err')}S.drag=false});
 $$('.tab').forEach(b=>b.onclick=()=>{S.tab=b.dataset.t;$$('.tab').forEach(x=>x.classList.toggle('on',x===b));
- const r=S.tab==='rules';$('#feed').hidden=r;$('#rulesBox').hidden=!r;$('#feedTools').hidden=r;$('#ruleTools').hidden=!r;
- if(r)loadRules();else{S.unseen=0;$('#tabFeed').hidden=true;S.fresh=new Set();renderFeed()}});
+ const t=S.tab;
+ $('#feed').hidden=(t!=='feed');
+ $('#rulesBox').hidden=(t!=='rules');
+ $('#piholeBox').hidden=(t!=='pihole');
+ $('#feedTools').hidden=(t!=='feed');
+ $('#ruleTools').hidden=(t!=='rules');
+ if(t==='rules')loadRules();
+ else if(t==='pihole')loadPiholeBlocks();
+ else{S.unseen=0;$('#tabFeed').hidden=true;S.fresh=new Set();renderFeed()}});
 $$('.fc').forEach(b=>b.onclick=()=>{S.filter=b.dataset.f;$$('.fc').forEach(x=>x.classList.toggle('on',x===b));S.fresh=new Set();renderFeed()});
 $('#cand').onchange=e=>{S.cand=e.target.checked;S.fresh=new Set();renderFeed()};
 $('#q').oninput=e=>{S.q=e.target.value;S.limit=50;renderRules()};
 $('#catSel').onchange=e=>{S.cat=e.target.value;S.limit=50;renderRules()};
 $('#rulesNote').addEventListener('click',e=>{if(e.target.closest('#more')){S.limit+=50;renderRules()}});
-setInterval(()=>{if(S.tab==='rules'&&!document.hidden)loadRules()},10000);
+setInterval(()=>{
+ if(!document.hidden){
+  if(S.tab==='rules')loadRules();
+  if(S.tab==='pihole')loadPiholeBlocks();
+ }
+},10000);
 async function doAllow(d,btn){
  try{await api('/api/allow',{domain:d});toast('Allowed '+d,'ok');if(S.tab==='rules')loadRules()}catch(e){toast(e.message,'err');if(btn&&btn.isConnected){btn.textContent='Allow';btn.classList.remove('armed')}}}
 $('#rulesBody').addEventListener('click',e=>{const b=e.target.closest('[data-allow]');if(b)armed(b,'Sure?',()=>doAllow(b.dataset.allow,b))});
@@ -1026,7 +1216,7 @@ $('#cats').addEventListener('click',e=>{
  const b=e.target.closest('[data-clear]'),all=e.target.closest('#clearAll');
  if(b){const c=b.dataset.clear;armed(b,'Sure?',()=>doReset([c],CATL[c]))}
  else if(all)armed(all,'Tap again to clear everything',()=>doReset('all','all categories'))});
-setAgg(7);poll();loadRules();
+setAgg(7);poll();loadRules();loadPiholeBlocks();
 </script></body></html>
 """
 
@@ -1079,10 +1269,29 @@ def main():
     print(f"Pi-Scout UI  ·  core: {core_path}")
     print(f"  Categories: {core.categories_label()}   Aggression: {args.aggression}   Gemini key: {'found' if key else 'MISSING'}")
     print(f"  Open: {url}\n  Ctrl+C to quit.")
-    if args.autostart:
-        ok, msg = ENGINE.start("live")
-        if not ok:
-            print(f"  ⚠️ Could not autostart: {msg}")
+
+    config = load_config()
+    autostart_on = args.autostart or config.get("autostart", False)
+    if autostart_on:
+        print("  Autostart enabled: waiting for database readiness...")
+        def delayed_autostart():
+            db_path = "/etc/pihole/pihole-FTL.db"
+            for _ in range(30):
+                if os.path.exists(db_path):
+                    try:
+                        conn = sqlite3.connect(db_path, timeout=2)
+                        conn.execute("SELECT 1 FROM queries LIMIT 1;")
+                        conn.close()
+                        break
+                    except Exception:
+                        pass
+                time.sleep(1)
+            print("  System ready. Initiating 30-day history scan -> live sequence...")
+            ENGINE._chain_to_live = True
+            ENGINE.start("audit")
+
+        threading.Thread(target=delayed_autostart, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
